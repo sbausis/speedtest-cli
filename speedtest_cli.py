@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# Copyright 2012-2014 Matt Martz
+# Copyright 2012-2015 Matt Martz
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,12 +15,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-__version__ = '0.3.1'
-
-# Some global variables we use
-source = None
-shutdown_event = None
-
 import os
 import re
 import sys
@@ -28,7 +22,17 @@ import math
 import signal
 import socket
 import timeit
+import platform
 import threading
+
+__version__ = '0.3.4'
+
+# Some global variables we use
+user_agent = None
+source = None
+shutdown_event = None
+scheme = 'http'
+
 
 # Used for bound_interface
 socket_socket = socket.socket
@@ -51,7 +55,15 @@ except ImportError:
 try:
     from httplib import HTTPConnection, HTTPSConnection
 except ImportError:
-    from http.client import HTTPConnection, HTTPSConnection
+    e_http_py2 = sys.exc_info()
+    try:
+        from http.client import HTTPConnection, HTTPSConnection
+    except ImportError:
+        e_http_py3 = sys.exc_info()
+        raise SystemExit('Your python installation is missing required HTTP '
+                         'client classes:\n\n'
+                         'Python 2: %s\n'
+                         'Python 3: %s' % (e_http_py2[1], e_http_py3[1]))
 
 try:
     from Queue import Queue
@@ -138,6 +150,13 @@ else:
     del builtins
 
 
+class SpeedtestCliServerListError(Exception):
+    """Internal Exception class used to indicate to move on to the next
+    URL for retrieving speedtest.net server details
+
+    """
+
+
 def bound_socket(*args, **kwargs):
     """Bind socket to a specified source IP address"""
 
@@ -156,13 +175,62 @@ def distance(origin, destination):
 
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a = (math.sin(dlat / 2) * math.sin(dlat / 2) + math.cos(math.radians(lat1))
-         * math.cos(math.radians(lat2)) * math.sin(dlon / 2)
-         * math.sin(dlon / 2))
+    a = (math.sin(dlat / 2) * math.sin(dlat / 2) +
+         math.cos(math.radians(lat1)) *
+         math.cos(math.radians(lat2)) * math.sin(dlon / 2) *
+         math.sin(dlon / 2))
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     d = radius * c
 
     return d
+
+
+def build_user_agent():
+    """Build a Mozilla/5.0 compatible User-Agent string"""
+
+    global user_agent
+    if user_agent:
+        return user_agent
+
+    ua_tuple = (
+        'Mozilla/5.0',
+        '(%s; U; %s; en-us)' % (platform.system(), platform.architecture()[0]),
+        'Python/%s' % platform.python_version(),
+        '(KHTML, like Gecko)',
+        'speedtest-cli/%s' % __version__
+    )
+    user_agent = ' '.join(ua_tuple)
+    return user_agent
+
+
+def build_request(url, data=None, headers={}):
+    """Build a urllib2 request object
+
+    This function automatically adds a User-Agent header to all requests
+
+    """
+
+    if url[0] == ':':
+        schemed_url = '%s%s' % (scheme, url)
+    else:
+        schemed_url = url
+
+    headers['User-Agent'] = user_agent
+    return Request(schemed_url, data=data, headers=headers)
+
+
+def catch_request(request):
+    """Helper function to catch common exceptions encountered when
+    establishing a connection with a HTTP/HTTPS request
+
+    """
+
+    try:
+        uh = urlopen(request)
+        return uh, False
+    except (HTTPError, URLError, socket.error):
+        e = sys.exc_info()[1]
+        return None, e
 
 
 class FileGetter(threading.Thread):
@@ -178,7 +246,8 @@ class FileGetter(threading.Thread):
         self.result = [0]
         try:
             if (timeit.default_timer() - self.starttime) <= 10:
-                f = urlopen(self.url)
+                request = build_request(self.url)
+                f = urlopen(request)
                 while 1 and not shutdown_event.isSet():
                     self.result.append(len(f.read(10240)))
                     if self.result[-1] == 0:
@@ -242,7 +311,8 @@ class FilePutter(threading.Thread):
         try:
             if ((timeit.default_timer() - self.starttime) <= 10 and
                     not shutdown_event.isSet()):
-                f = urlopen(self.url, self.data)
+                request = build_request(self.url, data=self.data)
+                f = urlopen(request)
                 f.read(11)
                 f.close()
                 self.result = len(self.data)
@@ -305,7 +375,11 @@ def getConfig():
     we are interested in
     """
 
-    uh = urlopen('http://www.speedtest.net/speedtest-config.php')
+    request = build_request('://www.speedtest.net/speedtest-config.php')
+    uh, e = catch_request(request)
+    if e:
+        print_('Could not retrieve speedtest.net configuration: %s' % e)
+        sys.exit(1)
     configxml = []
     while 1:
         configxml.append(uh.read(10240))
@@ -322,7 +396,7 @@ def getConfig():
                 'times': root.find('times').attrib,
                 'download': root.find('download').attrib,
                 'upload': root.find('upload').attrib}
-        except AttributeError:
+        except AttributeError:  # Python3 branch
             root = DOM.parseString(''.join(configxml))
             config = {
                 'client': getAttributesByTagName(root, 'client'),
@@ -342,41 +416,67 @@ def closestServers(client, all=False):
     distance
     """
 
-    uh = urlopen('http://www.speedtest.net/speedtest-servers-static.php')
-    serversxml = []
-    while 1:
-        serversxml.append(uh.read(10240))
-        if len(serversxml[-1]) == 0:
-            break
-    if int(uh.code) != 200:
-        return None
-    uh.close()
-    try:
-        try:
-            root = ET.fromstring(''.encode().join(serversxml))
-            elements = root.getiterator('server')
-        except AttributeError:
-            root = DOM.parseString(''.join(serversxml))
-            elements = root.getElementsByTagName('server')
-    except SyntaxError:
-        print_('Failed to parse list of speedtest.net servers')
-        sys.exit(1)
+    urls = [
+        '://www.speedtest.net/speedtest-servers-static.php',
+        '://c.speedtest.net/speedtest-servers-static.php',
+        '://www.speedtest.net/speedtest-servers.php',
+        '://c.speedtest.net/speedtest-servers.php',
+    ]
+    errors = []
     servers = {}
-    for server in elements:
+    for url in urls:
         try:
-            attrib = server.attrib
-        except AttributeError:
-            attrib = dict(list(server.attributes.items()))
-        d = distance([float(client['lat']), float(client['lon'])],
-                     [float(attrib.get('lat')), float(attrib.get('lon'))])
-        attrib['d'] = d
-        if d not in servers:
-            servers[d] = [attrib]
-        else:
-            servers[d].append(attrib)
-    del root
-    del serversxml
-    del elements
+            request = build_request(url)
+            uh, e = catch_request(request)
+            if e:
+                errors.append('%s' % e)
+                raise SpeedtestCliServerListError
+            serversxml = []
+            while 1:
+                serversxml.append(uh.read(10240))
+                if len(serversxml[-1]) == 0:
+                    break
+            if int(uh.code) != 200:
+                uh.close()
+                raise SpeedtestCliServerListError
+            uh.close()
+            try:
+                try:
+                    root = ET.fromstring(''.encode().join(serversxml))
+                    elements = root.getiterator('server')
+                except AttributeError:  # Python3 branch
+                    root = DOM.parseString(''.join(serversxml))
+                    elements = root.getElementsByTagName('server')
+            except SyntaxError:
+                raise SpeedtestCliServerListError
+            for server in elements:
+                try:
+                    attrib = server.attrib
+                except AttributeError:
+                    attrib = dict(list(server.attributes.items()))
+                d = distance([float(client['lat']),
+                              float(client['lon'])],
+                             [float(attrib.get('lat')),
+                              float(attrib.get('lon'))])
+                attrib['d'] = d
+                if d not in servers:
+                    servers[d] = [attrib]
+                else:
+                    servers[d].append(attrib)
+            del root
+            del serversxml
+            del elements
+        except SpeedtestCliServerListError:
+            continue
+
+        # We were able to fetch and parse the list of speedtest.net servers
+        if servers:
+            break
+
+    if not servers:
+        print_('Failed to retrieve list of speedtest.net servers:\n\n %s' %
+               '\n'.join(errors))
+        sys.exit(1)
 
     closest = []
     for d in sorted(servers.keys()):
@@ -408,8 +508,9 @@ def getBestServer(servers):
                     h = HTTPSConnection(urlparts[1])
                 else:
                     h = HTTPConnection(urlparts[1])
+                headers = {'User-Agent': user_agent}
                 start = timeit.default_timer()
-                h.request("GET", urlparts[2])
+                h.request("GET", urlparts[2], headers=headers)
                 r = h.getresponse()
                 total = (timeit.default_timer() - start)
             except (HTTPError, URLError, socket.error):
@@ -449,7 +550,7 @@ def version():
 def speedtest():
     """Run the full speedtest.net test"""
 
-    global shutdown_event, source
+    global shutdown_event, source, scheme
     shutdown_event = threading.Event()
 
     signal.signal(signal.SIGINT, ctrl_c)
@@ -469,7 +570,7 @@ def speedtest():
     except AttributeError:
         pass
     parser.add_argument('--bytes', dest='units', action='store_const',
-                        const=('bytes', 1), default=('bits', 8),
+                        const=('byte', 1), default=('bit', 8),
                         help='Display values in bytes instead of bits. Does '
                              'not affect the image generated by --share')
     parser.add_argument('--share', action='store_true',
@@ -484,6 +585,11 @@ def speedtest():
     parser.add_argument('--server', help='Specify a server ID to test against')
     parser.add_argument('--mini', help='URL of the Speedtest Mini server')
     parser.add_argument('--source', help='Source IP address to bind to')
+    parser.add_argument('--timeout', default=10, type=int,
+                        help='HTTP timeout in seconds. Default 10')
+    parser.add_argument('--secure', action='store_true',
+                        help='Use HTTPS instead of HTTP when communicating '
+                             'with speedtest.net operated servers')
     parser.add_argument('--version', action='store_true',
                         help='Show the version number and exit')
 
@@ -498,10 +604,18 @@ def speedtest():
     if args.version:
         version()
 
+    socket.setdefaulttimeout(args.timeout)
+
+    # Pre-cache the user agent string
+    build_user_agent()
+
     # If specified bind to a specific IP address
     if args.source:
         source = args.source
         socket.socket = bound_socket
+
+    if args.secure:
+        scheme = 'https'
 
     if not args.simple:
         print_('Retrieving speedtest.net configuration...')
@@ -521,16 +635,7 @@ def speedtest():
                 line = ('%(id)4s) %(sponsor)s (%(name)s, %(country)s) '
                         '[%(d)0.2f km]' % server)
                 serverList.append(line)
-            # Python 2.7 and newer seem to be ok with the resultant encoding
-            # from parsing the XML, but older versions have some issues.
-            # This block should detect whether we need to encode or not
-            try:
-                unicode()
-                print_('\n'.join(serverList).encode('utf-8', 'ignore'))
-            except NameError:
-                print_('\n'.join(serverList))
-            except IOError:
-                pass
+            print_('\n'.join(serverList).encode('utf-8', 'ignore'))
             sys.exit(0)
     else:
         servers = closestServers(config['client'])
@@ -553,7 +658,8 @@ def speedtest():
             url = args.mini
         urlparts = urlparse(url)
         try:
-            f = urlopen(args.mini)
+            request = build_request(args.mini)
+            f = urlopen(request)
         except:
             print_('Invalid Speedtest Mini URL')
             sys.exit(1)
@@ -564,7 +670,9 @@ def speedtest():
         if not extension:
             for ext in ['php', 'asp', 'aspx', 'jsp']:
                 try:
-                    f = urlopen('%s/speedtest/upload.%s' % (args.mini, ext))
+                    request = build_request('%s/speedtest/upload.%s' %
+                                            (args.mini, ext))
+                    f = urlopen(request)
                 except:
                     pass
                 else:
@@ -595,16 +703,8 @@ def speedtest():
         best = getBestServer(servers)
 
     if not args.simple:
-        # Python 2.7 and newer seem to be ok with the resultant encoding
-        # from parsing the XML, but older versions have some issues.
-        # This block should detect whether we need to encode or not
-        try:
-            unicode()
-            print_(('Hosted by %(sponsor)s (%(name)s) [%(d)0.2f km]: '
-                   '%(latency)s ms' % best).encode('utf-8', 'ignore'))
-        except NameError:
-            print_('Hosted by %(sponsor)s (%(name)s) [%(d)0.2f km]: '
-                   '%(latency)s ms' % best)
+        print_(('Hosted by %(sponsor)s (%(name)s) [%(d)0.2f km]: '
+               '%(latency)s ms' % best).encode('utf-8', 'ignore'))
     else:
         print_('Ping: %(latency)s ms' % best)
 
@@ -659,10 +759,14 @@ def speedtest():
                              (ping, ulspeedk, dlspeedk, '297aae72'))
                             .encode()).hexdigest()]
 
-        req = Request('http://www.speedtest.net/api/api.php',
-                      data='&'.join(apiData).encode())
-        req.add_header('Referer', 'http://c.speedtest.net/flash/speedtest.swf')
-        f = urlopen(req)
+        headers = {'Referer': 'http://c.speedtest.net/flash/speedtest.swf'}
+        request = build_request('://www.speedtest.net/api/api.php',
+                                data='&'.join(apiData).encode(),
+                                headers=headers)
+        f, e = catch_request(request)
+        if e:
+            print_('Could not submit results to speedtest.net: %s' % e)
+            sys.exit(1)
         response = f.read()
         code = f.code
         f.close()
@@ -677,8 +781,8 @@ def speedtest():
             print_('Could not submit results to speedtest.net')
             sys.exit(1)
 
-        print_('Share results: http://www.speedtest.net/result/%s.png' %
-               resultid[0])
+        print_('Share results: %s://www.speedtest.net/result/%s.png' %
+               (scheme, resultid[0]))
 
 
 def main():
